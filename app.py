@@ -4,66 +4,93 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(
-    page_title="鋼構圖面尺寸自動擷取工具", page_icon="📐", layout="centered"
-)
+st.set_page_config(page_title="PDF 零件長度擷取器", layout="centered")
 
-st.title("📐 鋼構 PDF 零件編號與最長尺寸自動擷取")
+st.title("📄 PDF 零件編號與最長尺寸擷取工具")
 st.write(
-    "請上傳您的 PDF 零件圖或清單檔案，系統將自動解析並計算每個零件編號的最長尺寸。"
+    "支援**單張**或**合併 PDF** 檔案。系統將自動逐頁掃描，抓取圖面內部的**零件編號 (MARK)** 與**最長尺寸線**。"
 )
 
+# 檔案上傳元件（支援多選）
 uploaded_files = st.file_uploader(
-    "選擇 PDF 檔案", type=["pdf"], accept_multiple_files=True
+    "選擇 PDF 檔案 (可單選或多選)", type=["pdf"], accept_multiple_files=True
 )
+
+
+def extract_pdf_data(file_obj):
+  results = []
+  # 使用 pdfplumber 逐頁開啟並解析 PDF
+  with pdfplumber.open(file_obj) as pdf:
+    for page_num, page in enumerate(pdf.pages, start=1):
+      text = page.extract_text()
+      if not text:
+        continue
+
+      # 1. 抓取圖面內部出現的零件編號 (例如 5CP16, 1CP91, 6CP1 等)
+      mark_matches = re.findall(
+          r"([A-Z0-9]+CP[0-9]+)", text, re.IGNORECASE
+      )
+
+      if mark_matches:
+        # 取該頁面找到的第一個（或主要的）零件編號作為代表
+        mark_name = mark_matches[0].upper().replace(".", "")
+      else:
+        # 如果該頁剛好沒抓到標記，則以頁碼命名避免遺漏
+        mark_name = f"PAGE_{page_num}"
+
+      # 2. 抓取圖面上的所有尺寸數值 (尋找 3 到 4 位數、可帶一位小數的數字)
+      number_matches = re.findall(r"\b([0-9]{3,4}\.[0-9]|[0-9]{4})\b", text)
+
+      valid_lengths = []
+      for num_str in number_matches:
+        val = float(num_str)
+        # 嚴格篩選長度範圍：限制在 800 到 4000 之間，並排除年份 2026 避免干擾
+        if 800 <= val <= 4000 and val != 2026:
+          valid_lengths.append(val)
+
+      # 3. 取得該頁面中最長的尺寸數值作為圖面總長度
+      max_length = max(valid_lengths) if valid_lengths else 0.0
+
+      if max_length > 0:
+        results.append({
+            "零件編號 (MARK)": mark_name,
+            "圖面最長尺寸": max_length,
+            "來源頁面": f"第 {page_num} 頁",
+        })
+
+  return results
+
 
 if uploaded_files:
-  all_records = []
+  if st.button("🚀 開始解析 PDF 資料"):
+    all_data = []
 
-  with st.spinner("正在解析 PDF 檔案，請稍候..."):
-    for uploaded_file in uploaded_files:
-      file_name = uploaded_file.name
-      default_mark = file_name.split(".")[0].replace("_", "").upper()
+    with st.spinner("正在逐頁解析 PDF 內容與尺寸，請稍候..."):
+      for uploaded_file in uploaded_files:
+        file_results = extract_pdf_data(uploaded_file)
+        all_data.extend(file_results)
 
-      pdf_bytes = uploaded_file.read()
-      max_len = 0
+    if all_data:
+      df = pd.DataFrame(all_data)
 
-      with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-          text = page.extract_text()
-          if text:
-            full_text += text + "\n"
+      # 顯示解析結果預覽
+      st.success(f"解析成功！總共抓取到 {len(df)} 筆零件尺寸資料。")
+      st.dataframe(df)
 
-        matches = re.findall(r"([0-9]{3,4}\.[0-9]|[0-9]{4})", full_text)
-        for m in matches:
-          val = float(m)
-          if 500 <= val <= 4000 and val != 2026:
-            if val > max_len:
-              max_len = val
+      # 轉換成 Excel 供下載
+      output = io.BytesIO()
+      with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="PDF資料")
+      processed_data = output.getvalue()
 
-      if max_len > 0:
-        all_records.append(
-            {"零件編號 (MARK)": default_mark, "最大尺寸 (LENGTH)": max_len}
-        )
-
-  if all_records:
-    df = pd.DataFrame(all_records)
-    df = df.groupby("零件編號 (MARK)", as_index=False)["最大尺寸 (LENGTH)"].max()
-
-    st.success(f"成功解析！總共取得 {len(df)} 筆零件資料。")
-    st.dataframe(df, use_container_width=True)
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-      df.to_excel(writer, index=False, sheet_name="PDF尺寸")
-    excel_data = output.getvalue()
-
-    st.download_button(
-        label="📥 下載整理好的 Excel 尺寸表",
-        data=excel_data,
-        file_name="PDF_Extracted_Lengths.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-  else:
-    st.warning("未能從上傳的 PDF 中偵測到有效的尺寸數據，請檢查檔案格式。")
+      st.download_button(
+          label="📥 下載 Excel 對照表",
+          data=processed_data,
+          file_name="PDF零件長度擷取結果.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      )
+    else:
+      st.warning(
+          "未能從上傳的 PDF 中抓取到符合條件的零件與尺寸，請確認 PDF"
+          " 是否為含有文字圖層的工程圖。"
+      )
